@@ -1,7 +1,9 @@
 *.bak
 config.json
 .env
-
+tmp-captures/
+tmp-captures-script-test/
+tmp-captures-upload/
 # IDE
 .vscode/
 .idea/
