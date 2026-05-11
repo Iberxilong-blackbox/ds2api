@@ -379,6 +379,17 @@ go run ./cmd/ds2api
 - `GET /admin/dev/raw-samples/query?q=关键词&limit=20`：按问题关键词查询当前内存抓包，并按 `chat_session_id` 归并 `completion + continue` 链
 - `POST /admin/dev/raw-samples/save`：把命中的某条抓包链保存为 `tests/raw_stream_samples/<sample-id>/` 回放样本
 
+本地 PowerShell 可用封装脚本减少重复命令：
+
+```powershell
+.\scripts\dev-capture.ps1 -List
+.\scripts\dev-capture.ps1 -OutDir .\tmp-captures
+.\scripts\dev-capture.ps1 -Query "关键词" -Limit 5
+.\scripts\dev-capture.ps1 -SaveSample -Query "关键词" -SampleId "debug-toolcall-001"
+```
+
+脚本会自动登录 Admin API，并把最新抓包展开为 `latest-request-body.json`、`latest-prompt.txt`、`latest-response-body.txt`、`latest-visible-output.txt` 和 `latest-meta.json`。通常不需要每次抓包前清空；抓包记录会按 `DS2API_DEV_PACKET_CAPTURE_LIMIT` 自动保留最近 N 条。
+
 返回字段包含：
 
 - `request_body`：发送给 DeepSeek 的完整请求体
