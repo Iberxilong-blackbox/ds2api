@@ -14,9 +14,6 @@ import (
 	"ds2api/internal/promptcompat"
 )
 
-const adminWebUISourceHeader = "X-Ds2-Source"
-const adminWebUISourceValue = "admin-webui-api-tester"
-
 type chatHistorySession struct {
 	store       *chathistory.Store
 	entryID     string
@@ -40,6 +37,7 @@ func startChatHistory(store *chathistory.Store, r *http.Request, a *auth.Request
 	entry, err := store.Start(chathistory.StartParams{
 		CallerID:    strings.TrimSpace(a.CallerID),
 		AccountID:   strings.TrimSpace(a.AccountID),
+		Surface:     "openai.chat_completions",
 		Model:       strings.TrimSpace(stdReq.ResponseModel),
 		Stream:      stdReq.Stream,
 		UserInput:   extractSingleUserInput(stdReq.Messages),
@@ -50,6 +48,7 @@ func startChatHistory(store *chathistory.Store, r *http.Request, a *auth.Request
 	startParams := chathistory.StartParams{
 		CallerID:    strings.TrimSpace(a.CallerID),
 		AccountID:   strings.TrimSpace(a.AccountID),
+		Surface:     "openai.chat_completions",
 		Model:       strings.TrimSpace(stdReq.ResponseModel),
 		Stream:      stdReq.Stream,
 		UserInput:   extractSingleUserInput(stdReq.Messages),
@@ -82,7 +81,7 @@ func shouldCaptureChatHistory(r *http.Request) bool {
 	if isVercelStreamPrepareRequest(r) || isVercelStreamReleaseRequest(r) {
 		return false
 	}
-	return strings.TrimSpace(r.Header.Get(adminWebUISourceHeader)) != adminWebUISourceValue
+	return true
 }
 
 func extractSingleUserInput(messages []any) string {
@@ -186,6 +185,23 @@ func (s *chatHistorySession) stopped(thinking, content, finishReason string) {
 		Usage:            openaifmt.BuildChatUsage(s.finalPrompt, thinking, content),
 		Completed:        true,
 	})
+}
+
+func historyTextForArchive(raw, visible string) string {
+	if strings.TrimSpace(raw) != "" {
+		return raw
+	}
+	return visible
+}
+
+func historyThinkingForArchive(raw, detection, visible string) string {
+	if strings.TrimSpace(raw) != "" {
+		return raw
+	}
+	if strings.TrimSpace(detection) != "" {
+		return detection
+	}
+	return visible
 }
 
 func (s *chatHistorySession) retryMissingEntry() bool {

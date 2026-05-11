@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"ds2api/internal/toolcall"
+	"ds2api/internal/util"
 )
 
 func TestBuildResponseObjectKeepsFencedToolPayloadAsText(t *testing.T) {
@@ -84,12 +85,24 @@ func TestBuildResponseObjectPromotesToolCallFromThinkingWhenTextEmpty(t *testing
 	)
 
 	output, _ := obj["output"].([]any)
-	if len(output) != 1 {
-		t.Fatalf("expected one output item, got %#v", obj["output"])
+	if len(output) != 2 {
+		t.Fatalf("expected reasoning message plus function_call output, got %#v", obj["output"])
 	}
 	first, _ := output[0].(map[string]any)
-	if first["type"] != "function_call" {
-		t.Fatalf("expected function_call output, got %#v", first["type"])
+	if first["type"] != "message" {
+		t.Fatalf("expected reasoning message output first, got %#v", first["type"])
+	}
+	content, _ := first["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("expected reasoning content, got %#v", first["content"])
+	}
+	block0, _ := content[0].(map[string]any)
+	if block0["type"] != "reasoning" {
+		t.Fatalf("expected reasoning block, got %#v", block0["type"])
+	}
+	second, _ := output[1].(map[string]any)
+	if second["type"] != "function_call" {
+		t.Fatalf("expected function_call output, got %#v", second["type"])
 	}
 }
 
@@ -175,5 +188,19 @@ func TestBuildResponseObjectWithToolCallsCoercesSchemaDeclaredStringArguments(t 
 	}
 	if args["content"] != `["a",1]` {
 		t.Fatalf("expected response content stringified by schema, got %#v", args["content"])
+	}
+}
+
+func TestBuildChatUsageForModelUsesConservativePromptCount(t *testing.T) {
+	prompt := strings.Repeat("上下文token ", 40)
+	usage := BuildChatUsageForModel("deepseek-v4-flash", prompt, "", "ok", 0)
+	promptTokens, _ := usage["prompt_tokens"].(int)
+	if promptTokens <= util.EstimateTokens(prompt) {
+		t.Fatalf("expected conservative prompt token count > rough estimate, got=%d estimate=%d", promptTokens, util.EstimateTokens(prompt))
+	}
+	totalTokens, _ := usage["total_tokens"].(int)
+	completionTokens, _ := usage["completion_tokens"].(int)
+	if totalTokens != promptTokens+completionTokens {
+		t.Fatalf("expected total tokens to add up, got usage=%#v", usage)
 	}
 }

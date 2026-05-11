@@ -12,6 +12,7 @@ import (
 	"ds2api/internal/httpapi/openai/history"
 	"ds2api/internal/httpapi/openai/shared"
 	"ds2api/internal/promptcompat"
+	"ds2api/internal/textclean"
 	"ds2api/internal/toolcall"
 	"ds2api/internal/toolstream"
 )
@@ -32,14 +33,13 @@ type Handler struct {
 
 type streamLease struct {
 	Auth      *auth.RequestAuth
+	Standard  promptcompat.StandardRequest
+	SessionID string
 	ExpiresAt time.Time
 }
 
-func (h *Handler) compatStripReferenceMarkers() bool {
-	if h == nil {
-		return true
-	}
-	return shared.CompatStripReferenceMarkers(h.Store)
+func stripReferenceMarkersEnabled() bool {
+	return textclean.StripReferenceMarkersEnabled()
 }
 
 func (h *Handler) applyCurrentInputFile(ctx context.Context, a *auth.RequestAuth, stdReq promptcompat.StandardRequest) (promptcompat.StandardRequest, error) {
@@ -80,6 +80,10 @@ func writeOpenAIError(w http.ResponseWriter, status int, message string) {
 	shared.WriteOpenAIError(w, status, message)
 }
 
+func writeOpenAIErrorWithCode(w http.ResponseWriter, status int, message, code string) {
+	shared.WriteOpenAIErrorWithCode(w, status, message, code)
+}
+
 func openAIErrorType(status int) string {
 	return shared.OpenAIErrorType(status)
 }
@@ -104,36 +108,12 @@ func cleanVisibleOutput(text string, stripReferenceMarkers bool) string {
 	return shared.CleanVisibleOutput(text, stripReferenceMarkers)
 }
 
-func replaceCitationMarkersWithLinks(text string, links map[int]string) string {
-	return shared.ReplaceCitationMarkersWithLinks(text, links)
-}
-
-func shouldWriteUpstreamEmptyOutputError(text string) bool {
-	return shared.ShouldWriteUpstreamEmptyOutputError(text)
-}
-
-func upstreamEmptyOutputDetail(contentFilter bool, text, thinking string) (int, string, string) {
-	return shared.UpstreamEmptyOutputDetail(contentFilter, text, thinking)
-}
-
-func writeUpstreamEmptyOutputError(w http.ResponseWriter, text, thinking string, contentFilter bool) bool {
-	return shared.WriteUpstreamEmptyOutputError(w, text, thinking, contentFilter)
-}
-
 func emptyOutputRetryEnabled() bool {
 	return shared.EmptyOutputRetryEnabled()
 }
 
 func emptyOutputRetryMaxAttempts() int {
 	return shared.EmptyOutputRetryMaxAttempts()
-}
-
-func clonePayloadForEmptyOutputRetry(payload map[string]any, parentMessageID int) map[string]any {
-	return shared.ClonePayloadForEmptyOutputRetry(payload, parentMessageID)
-}
-
-func usagePromptWithEmptyOutputRetry(originalPrompt string, retryAttempts int) string {
-	return shared.UsagePromptWithEmptyOutputRetry(originalPrompt, retryAttempts)
 }
 
 func formatIncrementalStreamToolCallDeltas(deltas []toolstream.ToolCallDelta, ids map[int]string) []map[string]any {
@@ -146,8 +126,4 @@ func filterIncrementalToolCallDeltasByAllowed(deltas []toolstream.ToolCallDelta,
 
 func formatFinalStreamToolCallsWithStableIDs(calls []toolcall.ParsedToolCall, ids map[int]string, toolsRaw any) []map[string]any {
 	return shared.FormatFinalStreamToolCallsWithStableIDs(calls, ids, toolsRaw)
-}
-
-func detectAssistantToolCalls(rawText, visibleText, exposedThinking, detectionThinking string, toolNames []string) toolcall.ToolCallParseResult {
-	return shared.DetectAssistantToolCalls(rawText, visibleText, exposedThinking, detectionThinking, toolNames)
 }

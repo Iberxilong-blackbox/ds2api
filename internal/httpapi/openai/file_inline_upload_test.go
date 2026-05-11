@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,8 +42,12 @@ func (m *inlineUploadDSStub) UploadFile(ctx context.Context, _ *auth.RequestAuth
 	if m.uploadErr != nil {
 		return nil, m.uploadErr
 	}
+	id := "file-inline-1"
+	if len(m.uploadCalls) > 1 {
+		id = "file-inline-" + fmt.Sprint(len(m.uploadCalls))
+	}
 	return &dsclient.UploadFileResult{
-		ID:       "file-inline-1",
+		ID:       id,
 		Filename: req.Filename,
 		Bytes:    int64(len(req.Data)),
 		Status:   "uploaded",
@@ -93,6 +98,9 @@ func TestPreprocessInlineFileInputsReplacesDataURLAndCollectsRefFileIDs(t *testi
 	}
 	if len(ds.uploadCalls) != 1 {
 		t.Fatalf("expected 1 upload, got %d", len(ds.uploadCalls))
+	}
+	if ds.uploadCalls[0].ModelType != "default" {
+		t.Fatalf("expected default model type when request omits model, got %q", ds.uploadCalls[0].ModelType)
 	}
 	if ds.lastCtx != ctx {
 		t.Fatalf("expected upload to use request context")
@@ -148,8 +156,8 @@ func TestPreprocessInlineFileInputsDeduplicatesIdenticalPayloads(t *testing.T) {
 
 func TestChatCompletionsUploadsInlineFilesBeforeCompletion(t *testing.T) {
 	ds := &inlineUploadDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
-	reqBody := `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":false}`
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
+	reqBody := `{"model":"deepseek-v4-vision","messages":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer direct-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -163,6 +171,9 @@ func TestChatCompletionsUploadsInlineFilesBeforeCompletion(t *testing.T) {
 	if len(ds.uploadCalls) != 1 {
 		t.Fatalf("expected 1 upload call, got %d", len(ds.uploadCalls))
 	}
+	if ds.uploadCalls[0].ModelType != "vision" {
+		t.Fatalf("expected vision model type for vision request, got %q", ds.uploadCalls[0].ModelType)
+	}
 	if ds.completionReq == nil {
 		t.Fatal("expected completion payload to be captured")
 	}
@@ -174,10 +185,10 @@ func TestChatCompletionsUploadsInlineFilesBeforeCompletion(t *testing.T) {
 
 func TestResponsesUploadsInlineFilesBeforeCompletion(t *testing.T) {
 	ds := &inlineUploadDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
-	reqBody := `{"model":"deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":false}`
+	reqBody := `{"model":"deepseek-v4-pro","input":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_image","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer direct-token")
 	req.Header.Set("Content-Type", "application/json")
@@ -191,6 +202,9 @@ func TestResponsesUploadsInlineFilesBeforeCompletion(t *testing.T) {
 	if len(ds.uploadCalls) != 1 {
 		t.Fatalf("expected 1 upload call, got %d", len(ds.uploadCalls))
 	}
+	if ds.uploadCalls[0].ModelType != "expert" {
+		t.Fatalf("expected expert model type for pro request, got %q", ds.uploadCalls[0].ModelType)
+	}
 	refIDs, _ := ds.completionReq["ref_file_ids"].([]any)
 	if len(refIDs) != 1 || refIDs[0] != "file-inline-1" {
 		t.Fatalf("unexpected completion ref_file_ids: %#v", ds.completionReq["ref_file_ids"])
@@ -199,7 +213,7 @@ func TestResponsesUploadsInlineFilesBeforeCompletion(t *testing.T) {
 
 func TestChatCompletionsInlineUploadFailureReturnsBadRequest(t *testing.T) {
 	ds := &inlineUploadDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
 	reqBody := `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,%%%"}}]}],"stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer direct-token")
@@ -216,9 +230,48 @@ func TestChatCompletionsInlineUploadFailureReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsInlineUploadLimitReturnsBadRequest(t *testing.T) {
+	ds := &inlineUploadDSStub{}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
+	content := []any{map[string]any{"type": "input_text", "text": "hi"}}
+	for i := 0; i < 51; i++ {
+		content = append(content, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": "data:image/png;base64,QUJDRA=="},
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model": "deepseek-v4-flash",
+		"messages": []any{map[string]any{
+			"role":    "user",
+			"content": content,
+		}},
+		"stream": false,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer direct-token")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "exceeded maximum of 50 inline files per request") {
+		t.Fatalf("expected inline file limit error, got body=%s", rec.Body.String())
+	}
+	if ds.completionReq != nil {
+		t.Fatalf("did not expect completion call after inline file limit error")
+	}
+}
+
 func TestResponsesInlineUploadFailureReturnsInternalServerError(t *testing.T) {
 	ds := &inlineUploadDSStub{uploadErr: errors.New("boom")}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 	reqBody := `{"model":"deepseek-v4-flash","input":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":false}`
@@ -241,7 +294,7 @@ func TestVercelPrepareUploadsInlineFilesBeforeLeasePayload(t *testing.T) {
 	t.Setenv("VERCEL", "1")
 	t.Setenv("DS2API_VERCEL_INTERNAL_SECRET", "stream-secret")
 	ds := &inlineUploadDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 	reqBody := `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJDRA=="}}]}],"stream":true}`

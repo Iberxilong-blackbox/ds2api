@@ -22,16 +22,27 @@ func (s *claudeStreamRuntime) send(event string, v any) {
 }
 
 func (s *claudeStreamRuntime) sendError(message string) {
+	s.sendErrorWithCode(500, message, "internal_error")
+}
+
+func (s *claudeStreamRuntime) sendErrorWithCode(status int, message, code string) {
 	msg := strings.TrimSpace(message)
 	if msg == "" {
 		msg = "upstream stream error"
 	}
+	if code == "" {
+		code = "internal_error"
+	}
+	errType := "api_error"
+	if status == 429 {
+		errType = "rate_limit_error"
+	}
 	s.send("error", map[string]any{
 		"type": "error",
 		"error": map[string]any{
-			"type":    "api_error",
+			"type":    errType,
 			"message": msg,
-			"code":    "internal_error",
+			"code":    code,
 			"param":   nil,
 		},
 	})
@@ -42,7 +53,10 @@ func (s *claudeStreamRuntime) sendPing() {
 }
 
 func (s *claudeStreamRuntime) sendMessageStart() {
-	inputTokens := util.EstimateTokens(fmt.Sprintf("%v", s.messages))
+	inputTokens := countClaudeInputTokensFromText(s.promptTokenText, s.model)
+	if inputTokens == 0 {
+		inputTokens = util.CountPromptTokens(fmt.Sprintf("%v", s.messages), s.model)
+	}
 	s.send("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{

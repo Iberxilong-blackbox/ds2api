@@ -217,6 +217,7 @@ export default function ApiTesterContainer({ config, onMessage, authFetch }) {
                 setSelectedAccount={setSelectedAccount}
                 effectiveKey={effectiveKey}
                 selectedAccount={selectedAccount}
+                model={model}
                 onMessage={onMessage}
                 response={response}
                 isStreaming={isStreaming}

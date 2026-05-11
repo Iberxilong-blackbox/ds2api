@@ -21,6 +21,18 @@ func BuildResponseObjectWithToolCalls(responseID, model, finalPrompt, finalThink
 	output := make([]any, 0, 2)
 	if len(detected) > 0 {
 		exposedOutputText = ""
+		if strings.TrimSpace(finalThinking) != "" {
+			output = append(output, map[string]any{
+				"type":   "message",
+				"id":     "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+				"role":   "assistant",
+				"status": "completed",
+				"content": []any{map[string]any{
+					"type": "reasoning",
+					"text": finalThinking,
+				}},
+			})
+		}
 		output = append(output, toResponsesFunctionCallItems(detected, toolsRaw)...)
 	} else {
 		content := make([]any, 0, 2)
@@ -70,7 +82,7 @@ func BuildResponseObjectFromItems(responseID, model, finalPrompt, finalThinking,
 		"model":       model,
 		"output":      output,
 		"output_text": outputText,
-		"usage":       BuildResponsesUsage(finalPrompt, finalThinking, finalText),
+		"usage":       BuildResponsesUsageForModel(model, finalPrompt, finalThinking, finalText, 0),
 	}
 }
 

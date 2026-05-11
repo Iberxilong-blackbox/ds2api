@@ -43,10 +43,6 @@
     "gpt-5.3-codex": "deepseek-v4-pro",
     "o3": "deepseek-v4-pro"
   },
-  "compat": {
-    "wide_input_strict_output": true,
-    "strip_reference_markers": true
-  },
   "responses": {
     "store_ttl_seconds": 900
   },

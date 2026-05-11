@@ -17,15 +17,15 @@ const {
   resolveToolcallPolicy,
   formatIncrementalToolCallDeltas,
   filterIncrementalToolCallDeltasByAllowed,
-  boolDefaultTrue,
   resetStreamToolCallState,
 } = require('./toolcall_policy');
-const { createChatCompletionEmitter } = require('./stream_emitter');
+const { createChatCompletionEmitter, createDeltaCoalescer } = require('./stream_emitter');
 const {
   asString,
   isAbortError,
   fetchStreamPrepare,
   fetchStreamPow,
+  fetchStreamSwitch,
   relayPreparedFailure,
   createLeaseReleaser,
 } = require('./http_internal');
@@ -47,18 +47,18 @@ async function handleVercelStream(req, res, rawBody, payload) {
   }
 
   const model = asString(prep.body.model) || asString(payload.model);
-  const sessionID = asString(prep.body.session_id) || `chatcmpl-${Date.now()}`;
+  const responseID = asString(prep.body.session_id) || `chatcmpl-${Date.now()}`;
   const leaseID = asString(prep.body.lease_id);
-  const deepseekToken = asString(prep.body.deepseek_token);
+  let deepseekToken = asString(prep.body.deepseek_token);
   const initialPowHeader = asString(prep.body.pow_header);
-  const completionPayload = prep.body.payload && typeof prep.body.payload === 'object' ? prep.body.payload : null;
+  let completionPayload = prep.body.payload && typeof prep.body.payload === 'object' ? prep.body.payload : null;
   const finalPrompt = asString(prep.body.final_prompt);
   const thinkingEnabled = toBool(prep.body.thinking_enabled);
   const searchEnabled = toBool(prep.body.search_enabled);
   const toolPolicy = resolveToolcallPolicy(prep.body, payload.tools);
   const toolNames = toolPolicy.toolNames;
   const emitEarlyToolDeltas = toolPolicy.emitEarlyToolDeltas;
-  const stripReferenceMarkers = boolDefaultTrue(prep.body.compat && prep.body.compat.strip_reference_markers);
+  const stripReferenceMarkers = true;
 
   if (!model || !leaseID || !deepseekToken || !initialPowHeader || !completionPayload) {
     writeOpenAIError(res, 500, 'invalid vercel prepare response');
@@ -134,13 +134,14 @@ async function handleVercelStream(req, res, rawBody, payload) {
       }
     };
     const fetchCompletion = (bodyPayload) => fetchDeepSeekStream(DEEPSEEK_COMPLETION_URL, bodyPayload, currentPowHeader);
+    let activeDeepSeekSessionID = responseID;
     const fetchContinue = async (messageID) => {
       const powHeader = await refreshPowHeader('continue');
       if (!powHeader) {
         return null;
       }
       return fetchDeepSeekStream(DEEPSEEK_CONTINUE_URL, {
-        chat_session_id: sessionID,
+        chat_session_id: activeDeepSeekSessionID,
         message_id: messageID,
         fallback_to_resume: true,
       }, powHeader);
@@ -186,11 +187,12 @@ async function handleVercelStream(req, res, rawBody, payload) {
     let ended = false;
     const { sendFrame, sendDeltaFrame } = createChatCompletionEmitter({
       res,
-      sessionID,
+      sessionID: responseID,
       created,
       model,
       isClosed: () => clientClosed,
     });
+    const deltaCoalescer = createDeltaCoalescer({ sendDeltaFrame });
 
     const finish = async (reason, options = {}) => {
       if (ended) {
@@ -201,6 +203,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
         await releaseLease();
         return true;
       }
+      deltaCoalescer.flush();
       const detected = parseStandaloneToolCalls(outputText, toolNames);
       if (detected.length > 0 && !toolCallsDoneEmitted) {
         toolCallsEmitted = true;
@@ -210,6 +213,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
         const tailEvents = flushToolSieve(toolSieveState, toolNames);
         for (const evt of tailEvents) {
           if (evt.type === 'tool_calls' && Array.isArray(evt.calls) && evt.calls.length > 0) {
+            deltaCoalescer.flush();
             toolCallsEmitted = true;
             toolCallsDoneEmitted = true;
             sendDeltaFrame({ tool_calls: formatOpenAIStreamToolCalls(evt.calls, streamToolCallIDs, payload.tools) });
@@ -217,9 +221,10 @@ async function handleVercelStream(req, res, rawBody, payload) {
             continue;
           }
           if (evt.text) {
-            sendDeltaFrame({ content: evt.text });
+            deltaCoalescer.append('content', evt.text);
           }
         }
+        deltaCoalescer.flush();
       }
       if (detected.length > 0 || toolCallsEmitted) {
         reason = 'tool_calls';
@@ -239,7 +244,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
       }
       ended = true;
       sendFrame({
-        id: sessionID,
+        id: responseID,
         object: 'chat.completion.chunk',
         created,
         model,
@@ -258,7 +263,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
 
     const processStream = async (initialResponse, allowDeferEmpty) => {
       let currentResponse = initialResponse;
-      let continueState = createContinueState(sessionID);
+      let continueState = createContinueState(activeDeepSeekSessionID);
       let continueRounds = 0;
       // eslint-disable-next-line no-constant-condition
       while (true) {
@@ -327,7 +332,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
                       continue;
                     }
                     thinkingText += trimmed;
-                    sendDeltaFrame({ reasoning_content: trimmed });
+                    deltaCoalescer.append('reasoning_content', trimmed);
                   }
                 } else {
                   const trimmed = trimContinuationOverlap(outputText, p.text);
@@ -339,7 +344,7 @@ async function handleVercelStream(req, res, rawBody, payload) {
                   }
                   outputText += trimmed;
                   if (!toolSieveEnabled) {
-                    sendDeltaFrame({ content: trimmed });
+                    deltaCoalescer.append('content', trimmed);
                     continue;
                   }
                   const events = processToolSieveChunk(toolSieveState, trimmed, toolNames);
@@ -352,19 +357,21 @@ async function handleVercelStream(req, res, rawBody, payload) {
                       const formatted = formatIncrementalToolCallDeltas(filtered, streamToolCallIDs);
                       if (formatted.length > 0) {
                         toolCallsEmitted = true;
-                      sendDeltaFrame({ tool_calls: formatted });
+                        deltaCoalescer.flush();
+                        sendDeltaFrame({ tool_calls: formatted });
                       }
                       continue;
                     }
                     if (evt.type === 'tool_calls') {
                       toolCallsEmitted = true;
                       toolCallsDoneEmitted = true;
+                      deltaCoalescer.flush();
                       sendDeltaFrame({ tool_calls: formatOpenAIStreamToolCalls(evt.calls, streamToolCallIDs, payload.tools) });
                       resetStreamToolCallState(streamToolCallIDs, streamToolNames);
                       continue;
                     }
                     if (evt.text) {
-                      sendDeltaFrame({ content: evt.text });
+                      deltaCoalescer.append('content', evt.text);
                     }
                   }
                 }
@@ -407,13 +414,39 @@ async function handleVercelStream(req, res, rawBody, payload) {
     };
 
     let retryAttempts = 0;
+    let accountSwitchAttempted = false;
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      const processed = await processStream(completionRes, retryAttempts < EMPTY_OUTPUT_RETRY_MAX_ATTEMPTS);
+      const allowDeferEmpty = retryAttempts < EMPTY_OUTPUT_RETRY_MAX_ATTEMPTS || !accountSwitchAttempted;
+      const processed = await processStream(completionRes, allowDeferEmpty);
       if (processed.terminal) {
         return;
       }
-      if (!processed.retryable || retryAttempts >= EMPTY_OUTPUT_RETRY_MAX_ATTEMPTS) {
+      if (!processed.retryable) {
+        await finish('stop');
+        return;
+      }
+      if (retryAttempts >= EMPTY_OUTPUT_RETRY_MAX_ATTEMPTS) {
+        if (!accountSwitchAttempted) {
+          accountSwitchAttempted = true;
+          const switched = await fetchStreamSwitch(req, leaseID);
+          if (switched.ok && switched.body && switched.body.payload && typeof switched.body.payload === 'object') {
+            completionPayload = switched.body.payload;
+            deepseekToken = asString(switched.body.deepseek_token) || deepseekToken;
+            currentPowHeader = asString(switched.body.pow_header) || currentPowHeader;
+            activeDeepSeekSessionID = asString(switched.body.session_id) || activeDeepSeekSessionID;
+            usagePrompt = finalPrompt;
+            completionRes = await fetchCompletion(completionPayload);
+            if (completionRes === null) {
+              return;
+            }
+            if (!completionRes.ok || !completionRes.body) {
+              await finish('stop');
+              return;
+            }
+            continue;
+          }
+        }
         await finish('stop');
         return;
       }
@@ -510,32 +543,51 @@ function observeContinueState(state, chunk) {
   if (topID > 0) {
     state.responseMessageID = topID;
   }
-  if (chunk.p === 'response/status') {
-    setContinueStatus(state, asString(chunk.v));
-  }
+  observeContinueDirectPatch(state, chunk.p, chunk.v);
   if (chunk.p === 'response') {
     observeContinueBatchPatches(state, 'response', chunk.v);
   } else {
     observeContinueBatchPatches(state, '', chunk.v);
   }
   const response = chunk.v && typeof chunk.v === 'object' ? chunk.v.response : null;
-  if (response && typeof response === 'object') {
-    const id = numberValue(response.message_id);
-    if (id > 0) {
-      state.responseMessageID = id;
-    }
-    setContinueStatus(state, asString(response.status));
-    if (response.auto_continue === true) {
-      state.lastStatus = 'AUTO_CONTINUE';
-    }
-  }
+  observeContinueResponseObject(state, response);
   const messageResponse = chunk.message && typeof chunk.message === 'object' && chunk.message.response;
-  if (messageResponse && typeof messageResponse === 'object') {
-    const id = numberValue(messageResponse.message_id);
-    if (id > 0) {
-      state.responseMessageID = id;
-    }
-    setContinueStatus(state, asString(messageResponse.status));
+  observeContinueResponseObject(state, messageResponse);
+}
+
+function observeContinueDirectPatch(state, path, value) {
+  if (!state) {
+    return;
+  }
+  switch (asString(path).trim().replace(/^\/+|\/+$/g, '')) {
+    case 'response/status':
+    case 'status':
+    case 'response/quasi_status':
+    case 'quasi_status':
+      setContinueStatus(state, asString(value));
+      break;
+    case 'response/auto_continue':
+    case 'auto_continue':
+      if (value === true) {
+        state.lastStatus = 'AUTO_CONTINUE';
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+function observeContinueResponseObject(state, response) {
+  if (!state || !response || typeof response !== 'object') {
+    return;
+  }
+  const id = numberValue(response.message_id);
+  if (id > 0) {
+    state.responseMessageID = id;
+  }
+  setContinueStatus(state, asString(response.status));
+  if (response.auto_continue === true) {
+    state.lastStatus = 'AUTO_CONTINUE';
   }
 }
 
@@ -562,6 +614,12 @@ function observeContinueBatchPatches(state, parentPath, raw) {
       case 'response/quasi_status':
       case 'quasi_status':
         setContinueStatus(state, asString(patch.v));
+        break;
+      case 'response/auto_continue':
+      case 'auto_continue':
+        if (patch.v === true) {
+          state.lastStatus = 'AUTO_CONTINUE';
+        }
         break;
       default:
         break;
@@ -611,9 +669,9 @@ function upstreamEmptyOutputDetail(contentFilter, _text, thinking) {
     };
   }
   return {
-    status: 429,
-    message: 'Upstream account hit a rate limit and returned empty output.',
-    code: 'upstream_empty_output',
+    status: 503,
+    message: 'Upstream service is unavailable and returned no output.',
+    code: 'upstream_unavailable',
   };
 }
 

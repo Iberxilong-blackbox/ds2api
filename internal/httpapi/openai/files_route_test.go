@@ -43,6 +43,7 @@ func (managedFilesAuthStub) Release(_ *auth.RequestAuth) {}
 type filesRouteDSStub struct {
 	lastReq dsclient.UploadFileRequest
 	upload  *dsclient.UploadFileResult
+	fetched *dsclient.UploadFileResult
 	err     error
 }
 
@@ -65,6 +66,16 @@ func (m *filesRouteDSStub) UploadFile(_ context.Context, _ *auth.RequestAuth, re
 	return &dsclient.UploadFileResult{ID: "file-123", Filename: req.Filename, Bytes: int64(len(req.Data)), Purpose: req.Purpose, Status: "uploaded"}, nil
 }
 
+func (m *filesRouteDSStub) FetchUploadedFile(_ context.Context, _ *auth.RequestAuth, fileID string) (*dsclient.UploadFileResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.fetched != nil {
+		return m.fetched, nil
+	}
+	return &dsclient.UploadFileResult{ID: fileID, Filename: "notes.txt", Bytes: 11, Purpose: "assistants", Status: "processed"}, nil
+}
+
 func (m *filesRouteDSStub) CallCompletion(_ context.Context, _ *auth.RequestAuth, _ map[string]any, _ string, _ int) (*http.Response, error) {
 	return nil, errors.New("not implemented")
 }
@@ -77,13 +88,18 @@ func (m *filesRouteDSStub) DeleteAllSessionsForToken(_ context.Context, _ string
 	return nil
 }
 
-func newMultipartUploadRequest(t *testing.T, purpose string, filename string, data []byte) *http.Request {
+func newMultipartUploadRequest(t *testing.T, purpose string, filename string, data []byte, model string) *http.Request {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if purpose != "" {
 		if err := writer.WriteField("purpose", purpose); err != nil {
 			t.Fatalf("write purpose failed: %v", err)
+		}
+	}
+	if model != "" {
+		if err := writer.WriteField("model", model); err != nil {
+			t.Fatalf("write model failed: %v", err)
 		}
 	}
 	part, err := writer.CreateFormFile("file", filename)
@@ -104,11 +120,11 @@ func newMultipartUploadRequest(t *testing.T, purpose string, filename string, da
 
 func TestFilesRouteUploadSuccess(t *testing.T) {
 	ds := &filesRouteDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 
-	req := newMultipartUploadRequest(t, "assistants", "notes.txt", []byte("hello world"))
+	req := newMultipartUploadRequest(t, "assistants", "notes.txt", []byte("hello world"), "deepseek-v4-vision")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -120,6 +136,9 @@ func TestFilesRouteUploadSuccess(t *testing.T) {
 	}
 	if ds.lastReq.Purpose != "assistants" {
 		t.Fatalf("expected purpose assistants, got %q", ds.lastReq.Purpose)
+	}
+	if ds.lastReq.ModelType != "vision" {
+		t.Fatalf("expected vision model type, got %q", ds.lastReq.ModelType)
 	}
 	if string(ds.lastReq.Data) != "hello world" {
 		t.Fatalf("unexpected uploaded data: %q", string(ds.lastReq.Data))
@@ -141,11 +160,11 @@ func TestFilesRouteUploadSuccess(t *testing.T) {
 
 func TestFilesRouteUploadIncludesAccountIDForManagedAccount(t *testing.T) {
 	ds := &filesRouteDSStub{}
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: managedFilesAuthStub{}, DS: ds}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: managedFilesAuthStub{}, DS: ds}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 
-	req := newMultipartUploadRequest(t, "assistants", "notes.txt", []byte("hello world"))
+	req := newMultipartUploadRequest(t, "assistants", "notes.txt", []byte("hello world"), "deepseek-v4-vision")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -161,8 +180,56 @@ func TestFilesRouteUploadIncludesAccountIDForManagedAccount(t *testing.T) {
 	}
 }
 
+func TestFilesRouteRetrieveSuccess(t *testing.T) {
+	ds := &filesRouteDSStub{fetched: &dsclient.UploadFileResult{
+		ID:       "file-123",
+		Filename: "notes.txt",
+		Bytes:    11,
+		Purpose:  "assistants",
+		Status:   "processed",
+	}}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: managedFilesAuthStub{}, DS: ds}
+	r := chi.NewRouter()
+	registerOpenAITestRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/files/file-123", nil)
+	req.Header.Set("Authorization", "Bearer direct-token")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v body=%s", err, rec.Body.String())
+	}
+	if out["id"] != "file-123" || out["filename"] != "notes.txt" || out["status"] != "processed" {
+		t.Fatalf("unexpected file object: %#v", out)
+	}
+	if out["account_id"] != "acct-123" {
+		t.Fatalf("expected account_id acct-123, got %#v", out["account_id"])
+	}
+}
+
+func TestFilesRouteRetrieveNotFound(t *testing.T) {
+	ds := &filesRouteDSStub{err: dsclient.ErrUploadFileNotFound}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: ds}
+	r := chi.NewRouter()
+	registerOpenAITestRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/files/missing-file", nil)
+	req.Header.Set("Authorization", "Bearer direct-token")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestFilesRouteRejectsNonMultipart(t *testing.T) {
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: &filesRouteDSStub{}}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: &filesRouteDSStub{}}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 
@@ -178,7 +245,7 @@ func TestFilesRouteRejectsNonMultipart(t *testing.T) {
 }
 
 func TestFilesRouteRequiresFileField(t *testing.T) {
-	h := &openAITestSurface{Store: mockOpenAIConfig{wideInput: true}, Auth: streamStatusAuthStub{}, DS: &filesRouteDSStub{}}
+	h := &openAITestSurface{Store: mockOpenAIConfig{}, Auth: streamStatusAuthStub{}, DS: &filesRouteDSStub{}}
 	r := chi.NewRouter()
 	registerOpenAITestRoutes(r, h)
 

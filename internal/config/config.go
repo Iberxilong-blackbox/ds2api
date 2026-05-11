@@ -15,13 +15,12 @@ type Config struct {
 	ModelAliases      map[string]string       `json:"model_aliases,omitempty"`
 	Admin             AdminConfig             `json:"admin,omitempty"`
 	Runtime           RuntimeConfig           `json:"runtime,omitempty"`
-	Compat            CompatConfig            `json:"compat,omitempty"`
 	Responses         ResponsesConfig         `json:"responses,omitempty"`
 	Embeddings        EmbeddingsConfig        `json:"embeddings,omitempty"`
 	AutoDelete        AutoDeleteConfig        `json:"auto_delete"`
-	HistorySplit      HistorySplitConfig      `json:"history_split"`
 	CurrentInputFile  CurrentInputFileConfig  `json:"current_input_file,omitempty"`
 	ThinkingInjection ThinkingInjectionConfig `json:"thinking_injection,omitempty"`
+	Vercel            VercelConfig            `json:"vercel,omitempty"`
 	VercelSyncHash    string                  `json:"_vercel_sync_hash,omitempty"`
 	VercelSyncTime    int64                   `json:"_vercel_sync_time,omitempty"`
 	AdditionalFields  map[string]any          `json:"-"`
@@ -101,6 +100,7 @@ func (c *Config) NormalizeCredentials() {
 		c.Accounts[i].Remark = strings.TrimSpace(c.Accounts[i].Remark)
 	}
 
+	c.Vercel = NormalizeVercelConfig(c.Vercel)
 	c.normalizeModelAliases()
 }
 
@@ -142,11 +142,6 @@ func (c *Config) normalizeModelAliases() {
 	}
 }
 
-type CompatConfig struct {
-	WideInputStrictOutput *bool `json:"wide_input_strict_output,omitempty"`
-	StripReferenceMarkers *bool `json:"strip_reference_markers,omitempty"`
-}
-
 type AdminConfig struct {
 	PasswordHash      string `json:"password_hash,omitempty"`
 	JWTExpireHours    int    `json:"jwt_expire_hours,omitempty"`
@@ -173,11 +168,6 @@ type AutoDeleteConfig struct {
 	Sessions bool   `json:"sessions,omitempty"`
 }
 
-type HistorySplitConfig struct {
-	Enabled           *bool `json:"enabled,omitempty"`
-	TriggerAfterTurns *int  `json:"trigger_after_turns,omitempty"`
-}
-
 type CurrentInputFileConfig struct {
 	Enabled  *bool `json:"enabled,omitempty"`
 	MinChars int   `json:"min_chars,omitempty"`
@@ -186,4 +176,25 @@ type CurrentInputFileConfig struct {
 type ThinkingInjectionConfig struct {
 	Enabled *bool  `json:"enabled,omitempty"`
 	Prompt  string `json:"prompt,omitempty"`
+}
+
+type VercelConfig struct {
+	Token     string `json:"token,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
+	TeamID    string `json:"team_id,omitempty"`
+}
+
+func NormalizeVercelConfig(v VercelConfig) VercelConfig {
+	return VercelConfig{
+		Token:     strings.TrimSpace(v.Token),
+		ProjectID: strings.TrimSpace(v.ProjectID),
+		TeamID:    strings.TrimSpace(v.TeamID),
+	}
+}
+
+func (c *Config) ClearVercelCredentials() {
+	if c == nil {
+		return
+	}
+	c.Vercel = VercelConfig{}
 }

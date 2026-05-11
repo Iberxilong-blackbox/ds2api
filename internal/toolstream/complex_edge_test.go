@@ -316,11 +316,11 @@ func TestSieve_CharByCharToolCall(t *testing.T) {
 func TestSieve_FullwidthPipeWrapperDSMLInvoke(t *testing.T) {
 	var state State
 	chunks := []string{
-		"<｜tool_calls>\n",
+		"<|tool_calls>\n",
 		"<|DSML|invoke name=\"read_file\">\n",
 		"<|DSML|parameter name=\"path\">README.md</|DSML|parameter>\n",
 		"</|DSML|invoke>\n",
-		"</｜tool_calls>",
+		"</|tool_calls>",
 	}
 	var events []Event
 	for _, c := range chunks {
@@ -382,7 +382,7 @@ func TestSieve_TagMentionInTextThenRealToolCall(t *testing.T) {
 	chunks := []string{
 		"建议的 commit message：\n\nfeat: expand DSML alias support\n\n",
 		"Add support for <dsml|tool_calls>, ",
-		"<｜tool_calls> (fullwidth pipe),\n",
+		"<|tool_calls> (pipe alias),\n",
 		"and <|tool_calls> wrapper variants.\n\n",
 		"<|DSML|tool_calls>\n",
 		"<|DSML|invoke name=\"Bash\">\n",
@@ -466,14 +466,14 @@ func TestSieve_ReviewSampleWithAliasMentionsPreservesBodyAndToolCalls(t *testing
 	chunks := []string{
 		"Done reviewing the diff. Here's my analysis before we commit:\n\n",
 		"Summary of Changes\n",
-		"DSML wrapper variant support — recognize aliases (<dsml|tool_calls>, <|tool_calls>, <｜tool_calls>) alongside canonical <tool_calls> and <|DSML|tool_calls> wrappers.\n\n",
+		"DSML wrapper variant support — recognize aliases (<dsml|tool_calls>, <|tool_calls>) alongside canonical <tool_calls> and <|DSML|tool_calls> wrappers.\n\n",
 		"<|DSML|tool_calls>\n",
 		"<|DSML|invoke name=\"Bash\">\n",
 		"<|DSML|parameter name=\"command\"><![CDATA[git add docs/toolcall-semantics.md internal/toolstream/tool_sieve_xml.go]]></|DSML|parameter>\n",
 		"<|DSML|parameter name=\"description\"><![CDATA[Stage all relevant changed files]]></|DSML|parameter>\n",
 		"</|DSML|invoke>\n",
 		"<|DSML|invoke name=\"Bash\">\n",
-		"<|DSML|parameter name=\"command\"><![CDATA[git commit -m \"$(cat <<'EOF'\nfeat(toolstream): expand DSML wrapper detection\n\nSupport DSML wrapper aliases: <dsml|tool_calls>, <|tool_calls>, <｜tool_calls> alongside existing canonical wrappers.\nEOF\n)\"]]></|DSML|parameter>\n",
+		"<|DSML|parameter name=\"command\"><![CDATA[git commit -m \"$(cat <<'EOF'\nfeat(toolstream): expand DSML wrapper detection\n\nSupport DSML wrapper aliases: <dsml|tool_calls> and <|tool_calls> alongside existing canonical wrappers.\nEOF\n)\"]]></|DSML|parameter>\n",
 		"<|DSML|parameter name=\"description\"><![CDATA[Create commit with all staged changes]]></|DSML|parameter>\n",
 		"</|DSML|invoke>\n",
 		"</|DSML|tool_calls>",
@@ -551,6 +551,51 @@ func TestSieve_ChineseReviewSamplePreservesInlineDSMLMention(t *testing.T) {
 		t.Fatalf("工具块后的正文应保留, got %q", text.String())
 	}
 	if strings.Contains(text.String(), "<|DSML|invoke") {
+		t.Fatalf("真实工具块不应泄漏到正文, got %q", text.String())
+	}
+}
+
+func TestSieve_HyphenatedDSMLShellWithHereDocCDATA(t *testing.T) {
+	var state State
+	chunks := []string{
+		"<dsml-tool-calls>\n",
+		"<dsml-invoke name=\"Bash\">\n",
+		"<dsml-parameter name=\"command\"><![CDATA[git commit -m \"$(cat <<'EOF'\n",
+		"docs: add missing directory entries and package descriptions to architecture docs\n",
+		"Fill gaps identified in architecture audit: add artifacts/ and static/ to\n",
+		"directory tree, and document 7 auxiliary internal/ packages (textclean,\n",
+		"claudeconv, compat, rawsample, devcapture, util, version) in Section 3.\n\n",
+		"Co-Authored-By: Claude Opus 4.7 noreply@anthropic.com\n",
+		"EOF\n",
+		")\"]]></dsml-parameter>\n",
+		"<dsml-parameter name=\"description\"><![CDATA[Create commit with architecture doc updates]]></dsml-parameter>\n",
+		"</dsml-invoke>\n",
+		"</dsml-tool-calls>",
+	}
+	var events []Event
+	for _, c := range chunks {
+		events = append(events, ProcessChunk(&state, c, []string{"Bash"})...)
+	}
+	events = append(events, Flush(&state, []string{"Bash"})...)
+
+	var text strings.Builder
+	var command string
+	callCount := 0
+	for _, e := range events {
+		text.WriteString(e.Content)
+		for _, call := range e.ToolCalls {
+			callCount++
+			command, _ = call.Input["command"].(string)
+		}
+	}
+
+	if callCount != 1 {
+		t.Fatalf("应解析出 1 个 hyphenated DSML 工具调用，got %d, text=%q", callCount, text.String())
+	}
+	if !strings.Contains(command, `git commit -m "$(cat <<'EOF'`) || !strings.Contains(command, "Co-Authored-By: Claude Opus 4.7") {
+		t.Fatalf("here-doc command 未完整保留, got %q", command)
+	}
+	if strings.Contains(text.String(), "dsml-tool-calls") || strings.Contains(text.String(), "git commit -m") {
 		t.Fatalf("真实工具块不应泄漏到正文, got %q", text.String())
 	}
 }
