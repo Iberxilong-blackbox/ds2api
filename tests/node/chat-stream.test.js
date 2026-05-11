@@ -137,7 +137,6 @@ async function runMockVercelStreamSequence(upstreamSequences, prepareOverrides =
     final_prompt: 'hello',
     thinking_enabled: false,
     search_enabled: false,
-    compat: { strip_reference_markers: true },
     tool_names: [],
     deepseek_token: 'deepseek-token',
     pow_header: 'pow-header',
@@ -188,9 +187,9 @@ test('vercel stream emits Go-parity empty-output failure on DONE', async () => {
   const { frames } = await runMockVercelStream(['data: [DONE]\n\n']);
   assert.equal(frames.length, 2);
   const failed = JSON.parse(frames[0]);
-  assert.equal(failed.status_code, 429);
-  assert.equal(failed.error.type, 'rate_limit_error');
-  assert.equal(failed.error.code, 'upstream_empty_output');
+  assert.equal(failed.status_code, 503);
+  assert.equal(failed.error.type, 'service_unavailable_error');
+  assert.equal(failed.error.code, 'upstream_unavailable');
   assert.equal(frames[1], '[DONE]');
 });
 
@@ -210,6 +209,126 @@ test('vercel stream retries empty output once and keeps one terminal frame', asy
   assert.match(completionBodies[1].prompt, /Previous reply had no visible output\. Please regenerate the visible final answer or tool call now\.$/);
 });
 
+test('vercel stream retries thinking-only output once', async () => {
+  const { frames, fetchURLs, fetchBodies } = await runMockVercelStreamSequence([
+    ['data: {"response_message_id":42,"p":"response/thinking_content","v":"plan"}\n\n', 'data: [DONE]\n\n'],
+    ['data: {"p":"response/content","v":"visible"}\n\n', 'data: [DONE]\n\n'],
+  ], { thinking_enabled: true });
+  const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+  const completionBodies = fetchBodies.filter((body) => Object.hasOwn(body, 'prompt'));
+  assert.equal(fetchURLs.filter((url) => url === 'https://chat.deepseek.com/api/v0/chat/completion').length, 2);
+  assert.equal(frames.filter((frame) => frame === '[DONE]').length, 1);
+  assert.equal(completionBodies[1].parent_message_id, 42);
+  assert.equal(parsed[0].choices[0].delta.reasoning_content, 'plan');
+  assert.equal(parsed[1].choices[0].delta.content, 'visible');
+  assert.equal(parsed[2].choices[0].finish_reason, 'stop');
+});
+
+test('vercel stream switches managed account after empty retry exhaustion', async () => {
+  const originalFetch = global.fetch;
+  const fetchURLs = [];
+  const completionBodies = [];
+  const completionAuth = [];
+  let completionCalls = 0;
+  global.fetch = async (url, init = {}) => {
+    const textURL = String(url);
+    fetchURLs.push(textURL);
+    if (textURL.includes('__stream_prepare=1')) {
+      return jsonResponse({
+        session_id: 'chatcmpl-test',
+        lease_id: 'lease-test',
+        model: 'gpt-test',
+        final_prompt: 'hello',
+        thinking_enabled: true,
+        search_enabled: false,
+        tool_names: [],
+        deepseek_token: 'token-1',
+        pow_header: 'pow-1',
+        payload: { chat_session_id: 'session-1', prompt: 'hello', ref_file_ids: ['file-1'] },
+      });
+    }
+    if (textURL.includes('__stream_pow=1')) {
+      return jsonResponse({ pow_header: 'pow-retry' });
+    }
+    if (textURL.includes('__stream_switch=1')) {
+      return jsonResponse({
+        session_id: 'session-2',
+        lease_id: 'lease-test',
+        model: 'gpt-test',
+        final_prompt: 'hello',
+        thinking_enabled: true,
+        search_enabled: false,
+        tool_names: [],
+        deepseek_token: 'token-2',
+        pow_header: 'pow-2',
+        payload: { chat_session_id: 'session-2', prompt: 'hello', ref_file_ids: ['file-2'] },
+      });
+    }
+    if (textURL.includes('__stream_release=1')) {
+      return jsonResponse({ success: true });
+    }
+    if (textURL === 'https://chat.deepseek.com/api/v0/chat/completion') {
+      completionBodies.push(JSON.parse(String(init.body)));
+      completionAuth.push(init.headers.authorization);
+      completionCalls += 1;
+      if (completionCalls <= 2) {
+        return sseResponse([`data: {"response_message_id":${40 + completionCalls},"p":"response/thinking_content","v":"plan"}\n\n`, 'data: [DONE]\n\n']);
+      }
+      return sseResponse(['data: {"p":"response/content","v":"visible"}\n\n', 'data: [DONE]\n\n']);
+    }
+    throw new Error(`unexpected fetch url: ${textURL}`);
+  };
+  try {
+    const req = new MockStreamRequest();
+    const res = new MockStreamResponse();
+    const payload = { model: 'gpt-test', stream: true };
+    await handleVercelStream(req, res, Buffer.from(JSON.stringify(payload)), payload);
+    const frames = parseSSEDataFrames(res.bodyText());
+    const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+    assert.equal(fetchURLs.filter((url) => url.includes('__stream_switch=1')).length, 1);
+    assert.equal(completionBodies.length, 3);
+    assert.match(completionBodies[1].prompt, /Previous reply had no visible output/);
+    assert.equal(completionBodies[1].parent_message_id, 41);
+    assert.equal(completionBodies[2].prompt, 'hello');
+    assert.deepEqual(completionBodies[2].ref_file_ids, ['file-2']);
+    assert.deepEqual(completionAuth, ['Bearer token-1', 'Bearer token-1', 'Bearer token-2']);
+    assert.equal(parsed.at(-1).choices[0].finish_reason, 'stop');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('vercel stream coalesces many small content deltas while keeping one choice', async () => {
+  const lines = Array.from({ length: 100 }, () => `data: ${JSON.stringify({ p: 'response/content', v: '字' })}\n\n`);
+  lines.push('data: [DONE]\n\n');
+  const { frames } = await runMockVercelStream(lines);
+  const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+  const contentFrames = parsed.filter((item) => item.choices?.[0]?.delta?.content);
+  const content = contentFrames.map((item) => item.choices[0].delta.content).join('');
+  assert.equal(content, '字'.repeat(100));
+  assert.ok(contentFrames.length < 100, `expected fewer than 100 content frames, got ${contentFrames.length}`);
+  for (const item of parsed) {
+    assert.equal(item.choices.length, 1);
+  }
+});
+
+test('vercel stream flushes reasoning before content and before stop', async () => {
+  const { frames } = await runMockVercelStream([
+    `data: ${JSON.stringify({ p: 'response/fragments', o: 'APPEND', v: [
+      { type: 'THINK', content: '思考' },
+      { type: 'THINK', content: '过程' },
+      { type: 'RESPONSE', content: '回答' },
+    ] })}\n\n`,
+    'data: [DONE]\n\n',
+  ], { thinking_enabled: true });
+  const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+  const reasoning = parsed.map((item) => item.choices?.[0]?.delta?.reasoning_content || '').join('');
+  const content = parsed.map((item) => item.choices?.[0]?.delta?.content || '').join('');
+  assert.equal(reasoning, '思考过程');
+  assert.equal(content, '回答');
+  assert.equal(parsed.at(-1).choices[0].finish_reason, 'stop');
+});
+
 test('vercel stream exhausts DeepSeek continue before synthetic retry', async () => {
   const { frames, fetchURLs, fetchBodies } = await runMockVercelStreamSequence([
     [
@@ -225,6 +344,42 @@ test('vercel stream exhausts DeepSeek continue before synthetic retry', async ()
   assert.equal(parsed[0].choices[0].delta.content, 'continued');
   assert.equal(parsed[1].choices[0].finish_reason, 'stop');
   assert.equal(fetchBodies.some((body) => String(body.prompt || '').includes('Previous reply had no visible output')), false);
+});
+
+test('vercel stream continues direct quasi_status incomplete before final tool call', async () => {
+  const { frames, fetchURLs } = await runMockVercelStreamSequence([
+    [
+      'data: {"response_message_id":7,"p":"response/content","v":"<tool_calls><invoke name=\\"write_file\\"><parameter name=\\"content\\"><![CDATA[part-one"}\n\n',
+      'data: {"p":"response/quasi_status","v":"INCOMPLETE"}\n\n',
+      'data: [DONE]\n\n',
+    ],
+    [
+      'data: {"response_message_id":8,"p":"response/content","v":"-part-two]]></parameter></invoke></tool_calls>"}\n\n',
+      'data: {"p":"response/status","v":"FINISHED"}\n\n',
+      'data: [DONE]\n\n',
+    ],
+  ], { tool_names: ['write_file'] });
+  const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+  const toolDelta = parsed.find((item) => item.choices?.[0]?.delta?.tool_calls);
+  assert.equal(fetchURLs.filter((url) => url === 'https://chat.deepseek.com/api/v0/chat/continue').length, 1);
+  assert.ok(toolDelta);
+  const args = JSON.parse(toolDelta.choices[0].delta.tool_calls[0].function.arguments);
+  assert.equal(args.content, 'part-one-part-two');
+  assert.equal(parsed.at(-1).choices[0].finish_reason, 'tool_calls');
+});
+
+
+
+test('vercel stream usage completion_tokens does not double-count visible output', async () => {
+  const sample = 'abcdefghijklmnopqrst';
+  const { frames } = await runMockVercelStream([
+    `data: ${JSON.stringify({ p: 'response/content', v: sample })}\n\n`,
+    'data: [DONE]\n\n',
+  ]);
+  const parsed = frames.filter((frame) => frame !== '[DONE]').map((frame) => JSON.parse(frame));
+  const terminal = parsed.find((item) => Array.isArray(item.choices) && item.choices[0] && item.choices[0].finish_reason);
+  assert.ok(terminal);
+  assert.equal(terminal.usage.completion_tokens, 5);
 });
 
 test('vercel stream reuses prior PoW when refresh fails', async () => {
@@ -243,7 +398,6 @@ test('vercel stream reuses prior PoW when refresh fails', async () => {
         final_prompt: 'hello',
         thinking_enabled: false,
         search_enabled: false,
-        compat: { strip_reference_markers: true },
         tool_names: [],
         deepseek_token: 'deepseek-token',
         pow_header: 'pow-header-initial',
@@ -497,14 +651,23 @@ test('parseChunkForContent drops thinking content when thinking is disabled', ()
     'text',
   );
   assert.equal(thinking.finished, false);
-  assert.equal(thinking.newType, 'text');
+  assert.equal(thinking.newType, 'thinking');
   assert.deepEqual(thinking.parts, []);
+
+  const hiddenContinuation = parseChunkForContent(
+    { v: 'still hidden' },
+    false,
+    thinking.newType,
+  );
+  assert.equal(hiddenContinuation.newType, 'thinking');
+  assert.deepEqual(hiddenContinuation.parts, []);
 
   const answer = parseChunkForContent(
     { p: 'response/content', v: 'visible answer' },
     false,
-    thinking.newType,
+    hiddenContinuation.newType,
   );
+  assert.equal(answer.newType, 'text');
   assert.deepEqual(answer.parts, [{ text: 'visible answer', type: 'text' }]);
 });
 
@@ -525,6 +688,12 @@ test('parseChunkForContent supports wrapped response.fragments object shape', ()
   assert.equal(parsed.parts.map((p) => p.text).join(''), 'AB');
 });
 
+test('parseChunkForContent reads object-shaped response/content payloads (Go parity)', () => {
+  const parsed = parseChunkForContent({ p: 'response/content', v: { text: 'vision text' } }, false, 'text', true);
+  assert.equal(parsed.parsed, true);
+  assert.deepEqual(parsed.parts, [{ text: 'vision text', type: 'text' }]);
+});
+
 test('parseChunkForContent preserves space-only content tokens', () => {
   const chunk = {
     p: 'response/content',
@@ -535,17 +704,38 @@ test('parseChunkForContent preserves space-only content tokens', () => {
   assert.deepEqual(parsed.parts, [{ text: ' ', type: 'text' }]);
 });
 
-test('parseChunkForContent strips reference markers from fragment content', () => {
+test('parseChunkForContent strips citation and reference markers from fragment content', () => {
   const chunk = {
     p: 'response/fragments',
     o: 'APPEND',
     v: [
-      { type: 'RESPONSE', content: '广州天气 [reference:12] 多云' },
+      { type: 'RESPONSE', content: '广州天气 [citation:1] [reference:12] 多云' },
     ],
   };
   const parsed = parseChunkForContent(chunk, false, 'text');
   assert.equal(parsed.finished, false);
-  assert.deepEqual(parsed.parts, [{ text: '广州天气  多云', type: 'text' }]);
+  assert.deepEqual(parsed.parts, [{ text: '广州天气   多云', type: 'text' }]);
+});
+
+test('parseChunkForContent strips leaked thought control markers from content', () => {
+  const chunk = {
+    p: 'response/content',
+    v: '<|▁of▁thought|>A<| of_thought |>B<| end_of_thought |>C',
+  };
+  const parsed = parseChunkForContent(chunk, false, 'text');
+  assert.equal(parsed.finished, false);
+  assert.deepEqual(parsed.parts, [{ text: 'ABC', type: 'text' }]);
+});
+
+test('parseChunkForContent strips fullwidth-delimited leaked control markers from content', () => {
+  const fw = '\uff5c';
+  const chunk = {
+    p: 'response/content',
+    v: `<${fw}begin▁of▁sentence${fw}>A<${fw}▁of▁thought${fw}>B<${fw} end_of_sentence ${fw}>C`,
+  };
+  const parsed = parseChunkForContent(chunk, false, 'text');
+  assert.equal(parsed.finished, false);
+  assert.deepEqual(parsed.parts, [{ text: 'ABC', type: 'text' }]);
 });
 
 test('parseChunkForContent detects content_filter status and ignores upstream output tokens', () => {
@@ -678,9 +868,11 @@ test('shouldSkipPath skips dynamic response/fragments/*/status paths only', () =
   assert.equal(shouldSkipPath('response/status'), false);
 });
 
-test('node stream path guard only allows /v1/chat/completions', () => {
+test('node stream path guard allows OpenAI v1 and root alias chat completions paths', () => {
   assert.equal(isNodeStreamSupportedPath('/v1/chat/completions'), true);
   assert.equal(isNodeStreamSupportedPath('/v1/chat/completions?x=1'), true);
+  assert.equal(isNodeStreamSupportedPath('/chat/completions'), true);
+  assert.equal(isNodeStreamSupportedPath('/chat/completions?x=1'), true);
   assert.equal(isNodeStreamSupportedPath('/v1beta/models/gemini-2.5-flash:streamGenerateContent'), false);
   assert.equal(isNodeStreamSupportedPath('/anthropic/v1/messages'), false);
 });
@@ -688,6 +880,7 @@ test('node stream path guard only allows /v1/chat/completions', () => {
 test('extractPathname strips query only', () => {
   assert.equal(extractPathname('/v1/chat/completions?stream=true'), '/v1/chat/completions');
   assert.equal(extractPathname('/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=1'), '/v1beta/models/gemini-2.5-flash:streamGenerateContent');
+  assert.equal(extractPathname('/chat/completions?stream=true'), '/chat/completions');
 });
 
 test('setCorsHeaders reflects requested third-party headers and blocks internal-only headers', () => {

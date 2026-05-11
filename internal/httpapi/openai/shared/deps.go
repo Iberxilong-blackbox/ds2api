@@ -35,16 +35,12 @@ type DeepSeekCaller interface {
 
 type ConfigReader interface {
 	ModelAliases() map[string]string
-	CompatWideInputStrictOutput() bool
-	CompatStripReferenceMarkers() bool
 	ToolcallMode() string
 	ToolcallEarlyEmitConfidence() string
 	ResponsesStoreTTLSeconds() int
 	EmbeddingsProvider() string
 	AutoDeleteMode() string
 	AutoDeleteSessions() bool
-	HistorySplitEnabled() bool
-	HistorySplitTriggerAfterTurns() int
 	CurrentInputFileEnabled() bool
 	CurrentInputFileMinChars() int
 	ThinkingInjectionEnabled() bool
@@ -56,13 +52,6 @@ type Deps struct {
 	Auth        AuthResolver
 	DS          DeepSeekCaller
 	ChatHistory *chathistory.Store
-}
-
-func CompatStripReferenceMarkers(store ConfigReader) bool {
-	if store == nil {
-		return true
-	}
-	return store.CompatStripReferenceMarkers()
 }
 
 var WriteJSON = util.WriteJSON

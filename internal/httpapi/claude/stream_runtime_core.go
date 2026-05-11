@@ -6,8 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"ds2api/internal/responsehistory"
 	"ds2api/internal/sse"
 	streamengine "ds2api/internal/stream"
+	"ds2api/internal/toolcall"
+	"ds2api/internal/toolstream"
 )
 
 type claudeStreamRuntime struct {
@@ -15,27 +18,37 @@ type claudeStreamRuntime struct {
 	rc       *http.ResponseController
 	canFlush bool
 
-	model     string
-	toolNames []string
-	messages  []any
-	toolsRaw  any
+	model           string
+	toolNames       []string
+	messages        []any
+	toolsRaw        any
+	promptTokenText string
 
 	thinkingEnabled       bool
 	searchEnabled         bool
 	bufferToolContent     bool
 	stripReferenceMarkers bool
 
-	messageID string
-	thinking  strings.Builder
-	text      strings.Builder
+	messageID         string
+	thinking          strings.Builder
+	text              strings.Builder
+	responseMessageID int
+
+	sieve                 toolstream.State
+	rawText               strings.Builder
+	rawThinking           strings.Builder
+	toolDetectionThinking strings.Builder
+	toolCallsDetected     bool
 
 	nextBlockIndex     int
 	thinkingBlockOpen  bool
 	thinkingBlockIndex int
 	textBlockOpen      bool
 	textBlockIndex     int
+	textEmitted        bool
 	ended              bool
 	upstreamErr        string
+	history            *responsehistory.Session
 }
 
 func newClaudeStreamRuntime(
@@ -49,6 +62,8 @@ func newClaudeStreamRuntime(
 	stripReferenceMarkers bool,
 	toolNames []string,
 	toolsRaw any,
+	promptTokenText string,
+	history *responsehistory.Session,
 ) *claudeStreamRuntime {
 	return &claudeStreamRuntime{
 		w:                     w,
@@ -62,6 +77,8 @@ func newClaudeStreamRuntime(
 		stripReferenceMarkers: stripReferenceMarkers,
 		toolNames:             toolNames,
 		toolsRaw:              toolsRaw,
+		promptTokenText:       promptTokenText,
+		history:               history,
 		messageID:             fmt.Sprintf("msg_%d", time.Now().UnixNano()),
 		thinkingBlockIndex:    -1,
 		textBlockIndex:        -1,
@@ -76,13 +93,36 @@ func (s *claudeStreamRuntime) onParsed(parsed sse.LineResult) streamengine.Parse
 		s.upstreamErr = parsed.ErrorMessage
 		return streamengine.ParsedDecision{Stop: true, StopReason: streamengine.StopReason("upstream_error")}
 	}
+	if parsed.ResponseMessageID > 0 {
+		s.responseMessageID = parsed.ResponseMessageID
+	}
 	if parsed.Stop {
 		return streamengine.ParsedDecision{Stop: true}
 	}
 
 	contentSeen := false
+	for _, p := range parsed.ToolDetectionThinkingParts {
+		trimmed := sse.TrimContinuationOverlapFromBuilder(&s.toolDetectionThinking, p.Text)
+		if trimmed != "" {
+			s.toolDetectionThinking.WriteString(trimmed)
+		}
+	}
 	for _, p := range parsed.Parts {
-		cleanedText := cleanVisibleOutput(p.Text, s.stripReferenceMarkers)
+		var rawTrimmed string
+		if p.Type == "thinking" {
+			rawTrimmed = sse.TrimContinuationOverlapFromBuilder(&s.rawThinking, p.Text)
+		} else {
+			rawTrimmed = sse.TrimContinuationOverlapFromBuilder(&s.rawText, p.Text)
+		}
+		if rawTrimmed == "" {
+			continue
+		}
+		if p.Type == "thinking" {
+			s.rawThinking.WriteString(rawTrimmed)
+		} else {
+			s.rawText.WriteString(rawTrimmed)
+		}
+		cleanedText := cleanVisibleOutput(rawTrimmed, s.stripReferenceMarkers)
 		if cleanedText == "" {
 			continue
 		}
@@ -95,7 +135,7 @@ func (s *claudeStreamRuntime) onParsed(parsed sse.LineResult) streamengine.Parse
 			if !s.thinkingEnabled {
 				continue
 			}
-			trimmed := sse.TrimContinuationOverlap(s.thinking.String(), cleanedText)
+			trimmed := sse.TrimContinuationOverlapFromBuilder(&s.thinking, cleanedText)
 			if trimmed == "" {
 				continue
 			}
@@ -125,44 +165,86 @@ func (s *claudeStreamRuntime) onParsed(parsed sse.LineResult) streamengine.Parse
 			continue
 		}
 
-		trimmed := sse.TrimContinuationOverlap(s.text.String(), cleanedText)
-		if trimmed == "" {
-			continue
-		}
-		s.text.WriteString(trimmed)
-		if s.bufferToolContent {
-			if hasUnclosedCodeFence(s.text.String()) {
-				continue
+		s.text.WriteString(cleanedText)
+
+		if !s.bufferToolContent {
+			s.closeThinkingBlock()
+			if !s.textBlockOpen {
+				s.textBlockIndex = s.nextBlockIndex
+				s.nextBlockIndex++
+				s.send("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": s.textBlockIndex,
+					"content_block": map[string]any{
+						"type": "text",
+						"text": "",
+					},
+				})
+				s.textBlockOpen = true
 			}
-			continue
-		}
-		s.closeThinkingBlock()
-		if !s.textBlockOpen {
-			s.textBlockIndex = s.nextBlockIndex
-			s.nextBlockIndex++
-			s.send("content_block_start", map[string]any{
-				"type":  "content_block_start",
+			s.send("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
 				"index": s.textBlockIndex,
-				"content_block": map[string]any{
-					"type": "text",
-					"text": "",
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": cleanedText,
 				},
 			})
-			s.textBlockOpen = true
+			s.textEmitted = true
+			continue
 		}
-		s.send("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": s.textBlockIndex,
-			"delta": map[string]any{
-				"type": "text_delta",
-				"text": trimmed,
-			},
-		})
+
+		events := toolstream.ProcessChunk(&s.sieve, rawTrimmed, s.toolNames)
+		for _, evt := range events {
+			if len(evt.ToolCalls) > 0 {
+				s.closeTextBlock()
+				s.toolCallsDetected = true
+				normalized := toolcall.NormalizeParsedToolCallsForSchemas(evt.ToolCalls, s.toolsRaw)
+				for _, tc := range normalized {
+					idx := s.nextBlockIndex
+					s.nextBlockIndex++
+					s.sendToolUseBlock(idx, tc)
+				}
+				continue
+			}
+			if evt.Content == "" {
+				continue
+			}
+			cleaned := cleanVisibleOutput(evt.Content, s.stripReferenceMarkers)
+			if cleaned == "" || (s.searchEnabled && sse.IsCitation(cleaned)) {
+				continue
+			}
+			s.closeThinkingBlock()
+			if !s.textBlockOpen {
+				s.textBlockIndex = s.nextBlockIndex
+				s.nextBlockIndex++
+				s.send("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": s.textBlockIndex,
+					"content_block": map[string]any{
+						"type": "text",
+						"text": "",
+					},
+				})
+				s.textBlockOpen = true
+			}
+			s.send("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": s.textBlockIndex,
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": cleaned,
+				},
+			})
+			s.textEmitted = true
+		}
 	}
 
+	if s.history != nil {
+		s.history.Progress(
+			responsehistory.ThinkingForArchive(s.rawThinking.String(), s.toolDetectionThinking.String(), s.thinking.String()),
+			responsehistory.TextForArchive(s.rawText.String(), s.text.String()),
+		)
+	}
 	return streamengine.ParsedDecision{ContentSeen: contentSeen}
-}
-
-func hasUnclosedCodeFence(text string) bool {
-	return strings.Count(text, "```")%2 == 1
 }

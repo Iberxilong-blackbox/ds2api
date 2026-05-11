@@ -9,7 +9,10 @@ type StandardRequest struct {
 	ResponseModel           string
 	Messages                []any
 	HistoryText             string
+	PromptTokenText         string
 	CurrentInputFileApplied bool
+	CurrentInputFileID      string
+	CurrentToolsFileID      string
 	ToolsRaw                any
 	FinalPrompt             string
 	ToolNames               []string
@@ -18,6 +21,7 @@ type StandardRequest struct {
 	Thinking                bool
 	Search                  bool
 	RefFileIDs              []string
+	RefFileTokens           int
 	PassThrough             map[string]any
 }
 

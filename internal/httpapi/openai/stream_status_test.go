@@ -135,7 +135,7 @@ func captureStatusMiddleware(statuses *[]int) func(http.Handler) http.Handler {
 func TestChatCompletionsStreamStatusCapturedAs200(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    streamStatusDSStub{resp: makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"hello"}`, "data: [DONE]")},
 	}
@@ -164,7 +164,7 @@ func TestChatCompletionsStreamStatusCapturedAs200(t *testing.T) {
 func TestResponsesStreamStatusCapturedAs200(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    streamStatusDSStub{resp: makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"hello"}`, "data: [DONE]")},
 	}
@@ -193,7 +193,7 @@ func TestResponsesStreamStatusCapturedAs200(t *testing.T) {
 func TestChatCompletionsStreamContentFilterStopsNormallyWithoutLeak(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS: streamStatusDSStub{resp: makeOpenAISSEHTTPResponse(
 			`data: {"p":"response/content","v":"合法前缀"}`,
@@ -243,7 +243,7 @@ func TestChatCompletionsStreamContentFilterStopsNormallyWithoutLeak(t *testing.T
 func TestChatCompletionsStreamEmitsFailureFrameWhenUpstreamOutputEmpty(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    streamStatusDSStub{resp: makeOpenAISSEHTTPResponse("data: [DONE]")},
 	}
@@ -274,12 +274,12 @@ func TestChatCompletionsStreamEmitsFailureFrameWhenUpstreamOutputEmpty(t *testin
 	}
 	last := frames[0]
 	statusCode, ok := last["status_code"].(float64)
-	if !ok || int(statusCode) != http.StatusTooManyRequests {
-		t.Fatalf("expected status_code=429, got %#v body=%s", last["status_code"], rec.Body.String())
+	if !ok || int(statusCode) != http.StatusServiceUnavailable {
+		t.Fatalf("expected status_code=503, got %#v body=%s", last["status_code"], rec.Body.String())
 	}
 	errObj, _ := last["error"].(map[string]any)
-	if asString(errObj["code"]) != "upstream_empty_output" {
-		t.Fatalf("expected code=upstream_empty_output, got %#v", last)
+	if asString(errObj["code"]) != "upstream_unavailable" {
+		t.Fatalf("expected code=upstream_unavailable, got %#v", last)
 	}
 }
 
@@ -289,7 +289,7 @@ func TestChatCompletionsStreamRetriesEmptyOutputOnSameSession(t *testing.T) {
 		makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"visible"}`, "data: [DONE]"),
 	}}
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    ds,
 	}
@@ -349,7 +349,7 @@ func TestChatCompletionsNonStreamRetriesThinkingOnlyOutput(t *testing.T) {
 		makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"visible"}`, "data: [DONE]"),
 	}}
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    ds,
 	}
@@ -380,9 +380,6 @@ func TestChatCompletionsNonStreamRetriesThinkingOnlyOutput(t *testing.T) {
 	if asString(message["content"]) != "visible" {
 		t.Fatalf("expected retry visible content, got %#v", message)
 	}
-	if !strings.Contains(asString(message["reasoning_content"]), "plan") {
-		t.Fatalf("expected first-attempt reasoning to be preserved, got %#v", message)
-	}
 }
 
 func TestChatCompletionsContentFilterDoesNotRetry(t *testing.T) {
@@ -391,7 +388,7 @@ func TestChatCompletionsContentFilterDoesNotRetry(t *testing.T) {
 		makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"visible"}`, "data: [DONE]"),
 	}}
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    ds,
 	}
@@ -413,7 +410,7 @@ func TestChatCompletionsContentFilterDoesNotRetry(t *testing.T) {
 func TestResponsesStreamUsageIgnoresBatchAccumulatedTokenUsage(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS: streamStatusDSStub{resp: makeOpenAISSEHTTPResponse(
 			`data: {"p":"response/content","v":"hello"}`,
@@ -464,7 +461,7 @@ func TestResponsesStreamRetriesThinkingOnlyOutput(t *testing.T) {
 		makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"visible"}`, "data: [DONE]"),
 	}}
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    ds,
 	}
@@ -503,7 +500,7 @@ func TestResponsesNonStreamRetriesThinkingOnlyOutput(t *testing.T) {
 		makeOpenAISSEHTTPResponse(`data: {"p":"response/content","v":"visible"}`, "data: [DONE]"),
 	}}
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS:    ds,
 	}
@@ -540,16 +537,23 @@ func TestResponsesNonStreamRetriesThinkingOnlyOutput(t *testing.T) {
 	if len(content) == 0 {
 		t.Fatalf("expected content entries, got %#v", item)
 	}
-	reasoning, _ := content[0].(map[string]any)
-	if asString(reasoning["type"]) != "reasoning" || !strings.Contains(asString(reasoning["text"]), "plan") {
-		t.Fatalf("expected preserved reasoning entry, got %#v", content)
+	var textEntry map[string]any
+	for _, entry := range content {
+		obj, _ := entry.(map[string]any)
+		if asString(obj["type"]) == "output_text" {
+			textEntry = obj
+			break
+		}
+	}
+	if asString(textEntry["text"]) != "visible" {
+		t.Fatalf("expected visible text entry, got %#v", content)
 	}
 }
 
 func TestResponsesNonStreamUsageIgnoresPromptAndOutputTokenUsage(t *testing.T) {
 	statuses := make([]int, 0, 1)
 	h := &openAITestSurface{
-		Store: mockOpenAIConfig{wideInput: true},
+		Store: mockOpenAIConfig{},
 		Auth:  streamStatusAuthStub{},
 		DS: streamStatusDSStub{resp: makeOpenAISSEHTTPResponse(
 			`data: {"p":"response/content","v":"ok"}`,

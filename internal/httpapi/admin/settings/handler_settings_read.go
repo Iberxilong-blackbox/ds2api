@@ -27,7 +27,6 @@ func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {
 			"global_max_inflight":          h.Store.RuntimeGlobalMaxInflight(recommended),
 			"token_refresh_interval_hours": h.Store.RuntimeTokenRefreshIntervalHours(),
 		},
-		"compat":      snap.Compat,
 		"responses":   snap.Responses,
 		"embeddings":  snap.Embeddings,
 		"auto_delete": snap.AutoDelete,

@@ -9,8 +9,8 @@
 ### 前置要求
 
 - Go 1.26+
-- Node.js `20.19+` 或 `22.12+`（WebUI 开发时）
-- npm（随 Node.js 提供）
+- Node.js `20.19+` 或 `22.12+`（WebUI 开发时；CI / Docker 构建使用 Node 24）
+- npm（随 Node.js 提供，建议 10+）
 
 ### 后端开发
 
@@ -36,7 +36,7 @@ go run ./cmd/ds2api
 cd webui
 
 # 2. 安装依赖
-npm install
+npm ci
 
 # 3. 启动开发服务器（热更新）
 npm run dev
